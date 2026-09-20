@@ -177,6 +177,12 @@ def _main_menu_keyboard(user_id: str):
             primary_btn(_tr(uid, "btn_withdraw"), callback_data="crypto_withdrawals"),
         ],
         [primary_btn(_tr(uid, "btn_refer"), callback_data="ref_command")],
+        [primary_btn(
+            "Game history",
+            callback_data="match_history",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📖")
+            or _ROLLERS_CASINO_EMOJI_MAP.get("📋"),
+        )],
         [InlineKeyboardButton(_tr(uid, "btn_settings"), callback_data="settings_menu")],
     ])
 
@@ -3415,6 +3421,11 @@ referral_daily_earnings = {}   # {referrer_id: {date_str: float}} — per-day ch
 referral_top_referred = {}     # {referrer_id: {referred_id: float}} — per-referred earnings
 referral_codes = {}            # {user_id: code_str}  — friendly referral codes
 referral_codes_reverse = {}    # {code_str: user_id}  — reverse lookup
+# Group partnership revenue share is intentionally separate from the normal
+# referral commission ledgers above.  Balances are signed: a positive balance
+# means the group owner is owed money; a negative balance means the casino is
+# owed money because referred players are currently profitable.
+group_partnerships = {}        # {chat_id: partnership configuration + stats}
 pending_challenges = {}  # Track player vs player challenges
 pending_coinflips = {}  # Track coinflip matches awaiting "Flip the coin" tap {cf_id: {...}}
 _CF_STICKER_SET_NAME = "Coinflipbyarshxyy"  # https://t.me/addstickers/Coinflipbyarshxyy
@@ -6056,6 +6067,7 @@ def load_data():
     global user_levels, user_boost_status, user_profiles, game_history, referral_data, referral_earnings, pending_referral_commissions
     global user_gift_profiles, processed_telegram_gifts, unattributed_telegram_gifts, gift_tracking_initialized
     global referral_wager_earnings, referral_deposit_earnings, referral_daily_earnings, referral_top_referred, referral_codes, referral_codes_reverse
+    global group_partnerships
     global pending_challenges, active_pvp_games, user_wagering_totals, user_losses_rakeback, user_streak_data
     global user_level_bonus_claimed
     global user_last_rakeback_claim, user_raffle_tickets, user_match_history, user_wagering_requirements, user_deposit_totals, user_deposit_history, user_tip_received, user_transfer_codes
@@ -6241,6 +6253,7 @@ def load_data():
         referral_top_referred = data.get('referral_top_referred', {})
         referral_codes = data.get('referral_codes', {})
         referral_codes_reverse = {v: k for k, v in referral_codes.items()}
+        group_partnerships = data.get('group_partnerships', {})
         pending_challenges = data.get('pending_challenges', {})
         active_pvp_games = data.get('active_pvp_games', {})
         user_wagering_totals = data.get('user_wagering_totals', {})
@@ -6645,6 +6658,7 @@ def _save_data_impl():
         'referral_daily_earnings': referral_daily_earnings,
         'referral_top_referred': referral_top_referred,
         'referral_codes': referral_codes,
+        'group_partnerships': group_partnerships,
         'pending_challenges': pending_challenges,
         'active_pvp_games': active_pvp_games,
         'user_wagering_totals': user_wagering_totals,
@@ -8726,6 +8740,79 @@ def add_loss_to_rakeback(user_id: str, loss_amount: float):
     # No save_data() here — caller (game handler) always calls save_data_critical() after.
     # Calling it here creates extra background threads that race against the game's own save.
 
+def _partnership_record(chat_id: int | str) -> dict | None:
+    """Return a normalized active partnership record for a group chat."""
+    record = group_partnerships.get(str(chat_id))
+    if not isinstance(record, dict) or not record.get("active"):
+        return None
+    record.setdefault("percentage", 0.30)
+    record.setdefault("owner_id", "")
+    record.setdefault("title", "Group")
+    record.setdefault("balance", 0.0)
+    record.setdefault("total_player_profit", 0.0)
+    record.setdefault("total_player_loss", 0.0)
+    record.setdefault("total_revenue_share", 0.0)
+    record.setdefault("settlements", 0)
+    record.setdefault("players", {})
+    return record
+
+def _settle_group_partnership_for_game(
+    user_id: str,
+    bet_amount: float,
+    winnings: float,
+    result: str = "",
+) -> None:
+    """Apply signed group revenue share using the player's real game result.
+
+    ``casino_net`` is positive when the player loses and negative when the
+    player wins.  Multiplying it by the configured percentage therefore makes
+    the partner balance negative for profitable players and move positive as
+    those players lose, in both directions at the same rate.
+    """
+    chat_id = user_last_group_chat.get(str(user_id))
+    if chat_id is None:
+        return
+    # Do not attribute a later private game to a group just because the user
+    # once spoke there. Group activity is refreshed by the group tracker.
+    if time.time() - float(user_last_group_chat_ts.get(str(user_id), 0.0)) > 2 * 60 * 60:
+        return
+    partnership = _partnership_record(chat_id)
+    if partnership is None:
+        return
+
+    bet = max(0.0, float(bet_amount))
+    paid = max(0.0, float(winnings))
+    casino_net = bet - paid
+    share = casino_net * max(0.0, min(1.0, float(partnership.get("percentage", 0.30))))
+    uid = str(user_id)
+    player = partnership["players"].setdefault(uid, {
+        "wagered": 0.0,
+        "casino_net": 0.0,
+        "revenue_share": 0.0,
+        "games": 0,
+    })
+    player["wagered"] += bet
+    player["casino_net"] += casino_net
+    player["revenue_share"] += share
+    player["games"] += 1
+    partnership["balance"] += share
+    partnership["total_revenue_share"] += share
+    partnership["settlements"] += 1
+    if casino_net >= 0:
+        partnership["total_player_loss"] += casino_net
+    else:
+        partnership["total_player_profit"] += -casino_net
+    partnership.setdefault("settlement_log", []).append({
+        "timestamp": int(time.time()),
+        "user_id": uid,
+        "casino_net": casino_net,
+        "share": share,
+        "result": result,
+    })
+    if len(partnership["settlement_log"]) > 500:
+        partnership["settlement_log"] = partnership["settlement_log"][-500:]
+    save_data_critical()
+
 def add_match_history(user_id: str, game_type: str, bet_amount: float, result: str, winnings: float = 0.0, custom_id: str = None):
     """Add match to user's history and update permanent lifetime counters."""
     user_id = str(user_id)
@@ -8736,7 +8823,8 @@ def add_match_history(user_id: str, game_type: str, bet_amount: float, result: s
     now_ts = int(time.time())
     match_data = {
         'timestamp': now_ts,
-        'id': custom_id or str(int(time.time() * 1000))[-5:],
+        # Keep a human-readable, real identifier for the Telegram history card.
+        'id': custom_id or str(int(time.time() * 1000))[-7:],
         'game': game_type,
         'bet': bet_amount,
         'result': result,  # 'win' or 'loss'
@@ -8773,6 +8861,20 @@ def add_match_history(user_id: str, game_type: str, bet_amount: float, result: s
         save_data_critical()
     except Exception as e:
         logger.error(f"add_match_history save_data error: {e}")
+
+    # Settlement is kept here, after the same result has been recorded in the
+    # real persisted match history.  The group ID comes from the last group
+    # message seen for this player; private games therefore cannot affect a
+    # group partnership.
+    try:
+        _settle_group_partnership_for_game(
+            user_id=user_id,
+            bet_amount=float(bet_amount),
+            winnings=float(winnings),
+            result=str(result),
+        )
+    except Exception as e:
+        logger.warning(f"[PARTNERSHIP] settlement skipped for {user_id}: {e}")
 
 
 def get_next_level_requirement(user_id: str) -> float:
@@ -10657,50 +10759,285 @@ async def webgames_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handle the /webgames command - alias for /games."""
     await games_command(update, context)
 
+def _ref_pack_tag(symbol: str, fallback: str | None = None) -> str:
+    """Render the exact Rollers Casino pack emoji when the pack is loaded."""
+    fallback = symbol if fallback is None else fallback
+    emoji_id = _ROLLERS_CASINO_EMOJI_MAP.get(symbol) or CUSTOM_EMOJI_MAP.get(symbol)
+    if not emoji_id:
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+def _referral_counts(user_id: str) -> dict:
+    uid = str(user_id)
+    invited = [str(referred) for referred, referrer in referral_data.items() if str(referrer) == uid]
+    pending = float(pending_referral_commissions.get(uid, 0.0) or 0.0)
+    claimed = float(referral_earnings.get(uid, 0.0) or 0.0)
+    wager = float(referral_wager_earnings.get(uid, 0.0) or 0.0)
+    deposits = float(referral_deposit_earnings.get(uid, 0.0) or 0.0)
+    partnerships = [
+        p for p in group_partnerships.values()
+        if isinstance(p, dict) and str(p.get("owner_id")) == uid and p.get("active")
+    ]
+    partnership_balance = sum(float(p.get("balance", 0.0) or 0.0) for p in partnerships)
+    return {
+        "invited": invited,
+        "pending": pending,
+        "claimed": claimed,
+        "wager": wager,
+        "deposits": deposits,
+        "total": pending + claimed,
+        "partnerships": partnerships,
+        "partnership_balance": partnership_balance,
+    }
+
+async def _referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
+    bot_info = await context.bot.get_me()
+    return f"https://t.me/{bot_info.username}?start={user_id}"
+
+def _referral_home_text(user_id: str, currency: str, referral_link: str) -> str:
+    stats = _referral_counts(user_id)
+    money = lambda value: format_balance_in_currency(value, currency)
+    return (
+        f"{_ref_pack_tag('🔥')} <b>Referral Program</b>\n\n"
+        f"Invite players with your link and earn from their activity.\n\n"
+        f"{_ref_pack_tag('👥')} <b>Invited users:</b> {len(stats['invited'])}\n"
+        f"{_ref_pack_tag('💰')} <b>Referral balance:</b> {money(stats['pending'])}\n"
+        f"{_ref_pack_tag('📈')} <b>Total referral earnings:</b> {money(stats['total'])}\n"
+        f"{_ref_pack_tag('✅')} <b>Added to balance:</b> {money(stats['claimed'])}\n\n"
+        f"{_ref_pack_tag('🔗')} <b>Your referral link:</b>\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"Deposit commission: <b>{REFERRAL_DEPOSIT_COMMISSION:.0%}</b>\n"
+        f"Wager commission: <b>{REFERRAL_WAGER_COMMISSION:.0%}</b>"
+    )
+
+def _referral_keyboard(user_id: str, referral_link: str) -> InlineKeyboardMarkup:
+    stats = _referral_counts(user_id)
+    rows = [
+        [
+            primary_btn(
+                "Referral earnings",
+                callback_data="ref_earnings",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📈"),
+            ),
+            primary_btn(
+                "Invited users",
+                callback_data="ref_invited",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("👥"),
+            ),
+        ],
+        [
+            primary_btn(
+                "Referral balance",
+                callback_data="ref_balance",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("💰"),
+            ),
+            primary_btn(
+                "Statistics",
+                callback_data="ref_statistics",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📊")
+                or _ROLLERS_CASINO_EMOJI_MAP.get("📈"),
+            ),
+        ],
+        [
+            primary_btn(
+                "Group partnership",
+                callback_data="ref_group",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("🏦"),
+            ),
+            primary_btn(
+                "Share link",
+                url=f"https://t.me/share/url?url={referral_link}&text=Join%20Rollers%20Casino%20and%20win!",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("🔗"),
+            ),
+        ],
+    ]
+    if stats["pending"] >= 1.50:
+        rows.append([
+            success_btn(
+                "Add to balance",
+                callback_data="ref_add_balance",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📥"),
+            )
+        ])
+    rows.append([
+        danger_btn(
+            "Withdraw",
+            callback_data="ref_withdraw",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📤"),
+        ),
+        danger_btn(
+            "Back",
+            callback_data="back_to_menu",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("❌"),
+        ),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+async def _group_owner_id(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    try:
+        members = await context.bot.get_chat_administrators(chat_id)
+        for member in members:
+            if getattr(member, "status", "") == "creator":
+                return str(member.user.id)
+    except Exception as exc:
+        logger.warning("[PARTNERSHIP] owner lookup failed for %s: %s", chat_id, exc)
+    return None
+
+def _partnership_keyboard(chat_id: int, active: bool) -> InlineKeyboardMarkup:
+    prefix = str(chat_id)
+    rows = [
+        [
+            primary_btn("10%", callback_data=f"partnership_rate:{prefix}:10"),
+            primary_btn("20%", callback_data=f"partnership_rate:{prefix}:20"),
+            primary_btn("30%", callback_data=f"partnership_rate:{prefix}:30"),
+        ],
+        [
+            primary_btn("40%", callback_data=f"partnership_rate:{prefix}:40"),
+            primary_btn("50%", callback_data=f"partnership_rate:{prefix}:50"),
+        ],
+    ]
+    rows.append([danger_btn(
+        "Deactivate" if active else "Activate",
+        callback_data=f"partnership_toggle:{prefix}",
+        icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("⚙️"),
+    )])
+    rows.append([danger_btn(
+        "Back",
+        callback_data="back_to_menu",
+        icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("❌"),
+    )])
+    return InlineKeyboardMarkup(rows)
+
+async def _show_partnership_setup(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    chat_key = str(chat_id)
+    record = group_partnerships.get(chat_key)
+    if not isinstance(record, dict):
+        record = {
+            "chat_id": chat_id,
+            "owner_id": "",
+            "title": "Group",
+            "percentage": 0.30,
+            "active": False,
+            "balance": 0.0,
+            "total_player_profit": 0.0,
+            "total_player_loss": 0.0,
+            "total_revenue_share": 0.0,
+            "settlements": 0,
+            "players": {},
+            "settlement_log": [],
+            "created_at": int(time.time()),
+        }
+        group_partnerships[chat_key] = record
+    title = record.get("title") or "Group"
+    state = "active" if record.get("active") else "inactive"
+    balance = float(record.get("balance", 0.0) or 0.0)
+    sign = "+" if balance >= 0 else ""
+    text = (
+        f"{_ref_pack_tag('🏦')} <b>Group partnership</b>\n\n"
+        f"Group: <b>{_html.escape(str(title))}</b>\n"
+        f"Status: <b>{state}</b>\n"
+        f"Revenue share: <b>{float(record.get('percentage', 0.30)):.0%}</b>\n"
+        f"Partner balance: <b>{sign}${balance:.2f}</b>\n\n"
+        "A positive balance is owed to the group owner. A negative balance "
+        "means the casino has paid more to profitable players than it has "
+        "earned from losses. Choose a percentage below or toggle the partnership."
+    )
+    await _edit_callback_text_or_send(
+        query, context, text,
+        reply_markup=_partnership_keyboard(chat_id, bool(record.get("active"))),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def partnership_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Let a Telegram group creator activate and configure revenue share."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user or chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text(
+            "Use /partnership inside the group you want to partner with."
+        )
+        return
+    owner_id = await _group_owner_id(context, chat.id)
+    if owner_id != str(user.id):
+        await update.effective_message.reply_text("Only the Telegram group owner can configure this partnership.")
+        return
+    record = group_partnerships.setdefault(str(chat.id), {
+        "chat_id": chat.id,
+        "owner_id": owner_id,
+        "title": chat.title or "Group",
+        "percentage": 0.30,
+        "active": False,
+        "balance": 0.0,
+        "total_player_profit": 0.0,
+        "total_player_loss": 0.0,
+        "total_revenue_share": 0.0,
+        "settlements": 0,
+        "players": {},
+        "settlement_log": [],
+        "created_at": int(time.time()),
+    })
+    record["owner_id"] = owner_id
+    record["title"] = chat.title or record.get("title") or "Group"
+    save_data_critical()
+    text = (
+        f"{_ref_pack_tag('🏦')} <b>Group partnership setup</b>\n\n"
+        f"Group: <b>{_html.escape(str(record['title']))}</b>\n"
+        f"Current status: <b>{'active' if record.get('active') else 'inactive'}</b>\n"
+        f"Current revenue share: <b>{float(record.get('percentage', 0.30)):.0%}</b>\n\n"
+        "Choose the percentage, then activate the partnership."
+    )
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=_partnership_keyboard(chat.id, bool(record.get("active"))),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def setrevshare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Text shortcut for a group creator to set a percentage."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user or chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text("Use /setrevshare inside a partnered group.")
+        return
+    owner_id = await _group_owner_id(context, chat.id)
+    if owner_id != str(user.id):
+        await update.effective_message.reply_text("Only the Telegram group owner can change the revenue share.")
+        return
+    try:
+        percent = float(context.args[0])
+    except (IndexError, ValueError):
+        await update.effective_message.reply_text("Usage: /setrevshare 30")
+        return
+    if not 0 <= percent <= 100:
+        await update.effective_message.reply_text("Revenue share must be between 0 and 100.")
+        return
+    record = group_partnerships.setdefault(str(chat.id), {
+        "chat_id": chat.id, "owner_id": owner_id, "title": chat.title or "Group",
+        "percentage": 0.30, "active": False, "balance": 0.0,
+        "total_player_profit": 0.0, "total_player_loss": 0.0,
+        "total_revenue_share": 0.0, "settlements": 0, "players": {},
+        "settlement_log": [], "created_at": int(time.time()),
+    })
+    record["owner_id"] = owner_id
+    record["title"] = chat.title or record.get("title") or "Group"
+    record["percentage"] = percent / 100.0
+    save_data_critical()
+    await update.effective_message.reply_text(
+        f"{_ref_pack_tag('✅')} Revenue share set to <b>{percent:.0f}%</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
 async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /ref command with the specific Rollers Casino interface."""
+    """Show the screenshot-style referral dashboard using persisted casino data."""
     if not update.message or not update.message.from_user:
         return
 
     user_id = str(update.message.from_user.id)
     username = update.message.from_user.username or update.message.from_user.first_name or "Player"
     user_currency = get_user_currency(user_id)
-    
-    # Get bot info for links
-    bot_info = await context.bot.get_me()
-    bot_username = bot_info.username
-    
-    # Stats
-    referrals_count = sum(1 for uid, rid in referral_data.items() if str(rid) == user_id)
-    available_funds = pending_referral_commissions.get(user_id, 0.0)
-    withdrawn_funds = referral_earnings.get(user_id, 0.0)
-    
-    # Links
-    referral_link = f"https://t.me/{bot_username}?start={user_id}"
-    group_link = "https://t.me/rollerscasino"
-    
-    referral_message = (
-        "<b>Referral Program</b>\n\n"
-        "Invite your friends to join the bot using referral link and earn money!\n\n"
-        "<b>Benefits</b>\n\n"
-        "- 8% of every deposit made by your referrals ($8 per $100 deposited)\n"
-        "- 20% of profit share\n"
-        "- 10% of the PvP commission of your referrals ($0 per $100 wagered)\n\n"
-        "<b>Group owners additional advantages</b>\n\n"
-        "- 40% of the dice PvP commission in your group ($0 per $100 wagered)\n\n"
-        f"Referrals count: <b>{referrals_count}</b>\n\n"
-        f"Available funds: <b>{format_balance_in_currency(available_funds, user_currency)}</b>\n"
-        f"Withdrawn funds: <b>{format_balance_in_currency(withdrawn_funds, user_currency)}</b>\n\n"
-        f"Your bot referral link: {referral_link}\n"
-        f"Your group referral link: {group_link}\n\n"
-        "Both bot and group links will make anyone that clicks on them instantly your referral, if he was not already referred and did not deposit yet"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("Redeem", callback_data="claim_referral_commission")],
-        [InlineKeyboardButton("🔗 Share link", url=f"https://t.me/share/url?url={referral_link}&text=Join%20Rollers%20Casino%20and%20win!")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    referral_link = await _referral_link(context, user_id)
+    referral_message = _referral_home_text(user_id, user_currency, referral_link)
+    reply_markup = _referral_keyboard(user_id, referral_link)
 
     # ── Generate referral image ──
     try:
@@ -10717,19 +11054,20 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
 
-        total_earned  = available_funds + withdrawn_funds
-        avg_per_ref   = (total_earned / referrals_count) if referrals_count > 0 else 0.0
+        stats = _referral_counts(user_id)
+        total_earned  = stats["total"]
+        avg_per_ref   = (total_earned / len(stats["invited"])) if stats["invited"] else 0.0
 
         img_buf = generate_ref_image(
             username           = username,
             user_id            = user_id,
             referral_code      = user_id[-8:].upper(),
             invite_link        = referral_link,
-            total_referrals    = referrals_count,
-            wager_bonus        = f"${available_funds * 0.7:.2f}",
-            deposit_bonus      = f"${available_funds * 0.3:.2f}",
-            total_claimed      = f"${withdrawn_funds:.2f}",
-            available_to_claim = f"${available_funds:.2f}",
+            total_referrals    = len(stats["invited"]),
+            wager_bonus        = f"${stats['wager']:.2f}",
+            deposit_bonus      = f"${stats['deposits']:.2f}",
+            total_claimed      = f"${stats['claimed']:.2f}",
+            available_to_claim = f"${stats['pending']:.2f}",
             earnings_rate      = "0.35% | 1%",
             total_earned       = f"${total_earned:.2f}",
             avg_per_referral   = f"${avg_per_ref:.2f}",
@@ -10739,7 +11077,7 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         await update.message.reply_photo(
             photo        = img_buf,
-            caption      = f"🎁 <b>Your Referral Code:</b> <code>{user_id[-8:].upper()}</code>\n🔗 <b>Invite Link:</b> {referral_link}\n\nShare this image and link to invite friends to earn rewards!",
+            caption      = f"{_ref_pack_tag('🎁')} <b>Your Referral Code:</b> <code>{user_id[-8:].upper()}</code>\n{_ref_pack_tag('🔗')} <b>Invite Link:</b> {referral_link}\n\nShare this image and link to invite friends to earn rewards!",
             reply_markup = reply_markup,
             parse_mode   = ParseMode.HTML,
         )
@@ -11665,6 +12003,7 @@ user_pending_bonus_msgs = {}  # {user_id: str}  — bonus notifications waiting 
 owner_bonus_wizard = {}  # {owner_id: {step: int, code, amount, max_uses, wager_mult, wager_hours, min_deposit, expiry_hours, specific_user}}
 user_pending_bonus_claims = {}  # {user_id: {code, bonus_amount, wager_multiplier, wager_hours}} — waiting for a deposit to activate
 user_last_group_chat = {}  # {user_id: last_group_chat_id} — used to ping deposit confirmations in the group too
+user_last_group_chat_ts = {}  # {user_id: timestamp} — prevents private games being assigned to a group
 CASINO_GROUP_CHAT_ID = int(os.getenv("CASINO_GROUP_ID", "-1004222734406"))  # Rollers Open — every deposit confirmation is also pinged here
 
 def sync_check_bonus_wager(user_id: str, bet_amount: float) -> None:
@@ -16786,56 +17125,118 @@ async def maxbet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 MATCHES_PER_PAGE = 15
 
+def _history_game_name(raw_game: str) -> str:
+    key = str(raw_game or "game").strip().lower()
+    names = {
+        "dice": "Dice Battle",
+        "dice_battle": "Dice Battle",
+        "tower": "Tower",
+        "slots": "Sweet Bonanza 1000",
+        "slotmachine": "Sweet Bonanza 1000",
+        "se": "Sweet Bonanza 1000",
+        "rr": "Rollers Roulette",
+        "rroulette": "Rollers Roulette",
+        "coinflip": "Coin Flip",
+        "blackjack": "Blackjack",
+        "mines": "Mines",
+        "keno": "Keno",
+        "limbo": "Limbo",
+        "hilo": "Hi-Lo",
+        "predict": "Predict",
+        "rps": "Rock Paper Scissors",
+        "wheel": "Wheel",
+        "darts": "Darts",
+        "bowling": "Bowling",
+        "basketball": "Basketball",
+        "soccer": "Soccer",
+        "football": "Soccer",
+        "plinko": "Plinko",
+        "scratch": "Scratch",
+    }
+    return names.get(key, str(raw_game or "Game").replace("_", " ").title())
+
+def _history_game_symbol(raw_game: str) -> str:
+    key = str(raw_game or "").strip().lower()
+    symbols = {
+        "dice": "🎲", "dice_battle": "🎲", "tower": "🗼",
+        "slots": "🎰", "slotmachine": "🎰", "se": "🎰",
+        "rr": "🎡", "rroulette": "🎡", "coinflip": "🪙",
+        "blackjack": "🃏", "mines": "💎", "keno": "🔢",
+        "limbo": "📈", "hilo": "🃏", "predict": "🎯",
+        "rps": "✂️", "wheel": "🎡", "darts": "🎯",
+        "bowling": "🎳", "basketball": "🏀", "soccer": "⚽",
+        "football": "⚽", "plinko": "🔴", "scratch": "🎫",
+    }
+    return symbols.get(key, "🎮")
+
+def _history_timestamp(timestamp: object) -> str:
+    try:
+        import datetime as _dt
+        value = float(timestamp or 0)
+        formatted = _dt.datetime.fromtimestamp(value).strftime("%d/%m/%y %I:%M %p")
+        return formatted.replace(" 0", " ")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "—"
+
 def _build_matches_page(user_id: str, page: int) -> tuple[str, InlineKeyboardMarkup] | None:
-    """Build the text + keyboard for a single page of /matches.
-    Returns (text, keyboard) or None if user has no matches at all."""
+    """Build the premium, real-data Telegram history card for one page."""
     matches = user_match_history.get(user_id, [])
     if not matches:
         return None
 
-    # Oldest first — so #1 is the player's very first game ever
-    sorted_matches = sorted(matches, key=lambda x: x.get('timestamp', 0))
+    # Telegram history opens on page 1 with the newest real matches first.
+    sorted_matches = sorted(matches, key=lambda x: x.get('timestamp', 0), reverse=True)
 
     total_pages = max(1, (len(sorted_matches) + MATCHES_PER_PAGE - 1) // MATCHES_PER_PAGE)
     page = max(1, min(page, total_pages))
     start = (page - 1) * MATCHES_PER_PAGE
     page_matches = sorted_matches[start:start + MATCHES_PER_PAGE]
 
-    game_emoji_map = {
-        "mines": "💎", "limbo": "🎯", "dice": "🎲", "coinflip": "🪙",
-        "predict": "📊", "tower": "🗼", "slots": "🎰", "blackjack": "🃏",
-        "roulette": "🎡", "darts": "🎯", "bowling": "🎳", "basketball": "🏀",
-        "soccer": "⚽", "football": "⚽", "crash": "✈️", "baccarat": "🎴",
-        "keno": "🔢", "rps": "✂️", "scratch": "🎫",
-        "wheel": "🎡", "plinko": "🔴", "hilo": "🔼",
-    }
-
     lines = []
-    for idx, match in enumerate(page_matches, start=start + 1):
-        game = str(match.get('game', 'Game')).capitalize()
+    for match in page_matches:
+        raw_game = str(match.get('game', 'Game'))
+        game = _history_game_name(raw_game)
         bet = float(match.get('bet', 0) or 0)
-        mult = float(match.get('multiplier', 0) or 0)
-        if mult == 0 and bet > 0:
-            win_amt = float(match.get('winnings', 0) or 0)
-            mult = (win_amt / bet) if bet > 0 else 0
-        status_emoji = "✅" if match.get('result') == 'win' else "❌"
-        bet_usd = bet / 100 if bet > 100 else bet
-        game_emoji = game_emoji_map.get(game.lower(), "🎮")
-        # Sequential bold number, bold game name
-        line = f"<b>{idx}.</b> {game_emoji} <b>{game}</b> ${bet_usd:.2f} {mult:.2f}x {status_emoji}"
-        lines.append(line)
+        payout = max(0.0, float(match.get('winnings', 0) or 0))
+        match_id = _html.escape(str(match.get("id") or "—").lstrip("#"))
+        entry = (
+            f"{_ref_pack_tag(_history_game_symbol(raw_game))} "
+            f"<b>{_html.escape(game)}</b> <code>#{match_id}</code>\n"
+            f"<blockquote>"
+            f"{_ref_pack_tag('⬆️')} <b>Bet</b>  <b>${bet:.2f}</b>\n"
+            f"{_ref_pack_tag('⬇️')} <b>Payout</b>  <b>${payout:.2f}</b>\n"
+            f"{_ref_pack_tag('🕓')} <b>{_history_timestamp(match.get('timestamp'))}</b>"
+            f"</blockquote>"
+        )
+        lines.append(entry)
 
-    header = f"📋 <b>Matches History</b>\nPage: <b>{page} / {total_pages}</b>\n\n"
-    text = header + "\n".join(lines)
+    header = (
+        f"{_ref_pack_tag('📖')} <b>Game History</b>\n"
+        f"Page: <b>{page}/{total_pages}</b>\n\n"
+    )
+    text = header + "\n\n".join(lines)
 
-    # Two-button paginator + Back
     nav_row = [
-        InlineKeyboardButton("⬅️ Prev Page", callback_data=f"matches_page_{page - 1}"),
-        InlineKeyboardButton("Next Page ➡️", callback_data=f"matches_page_{page + 1}"),
+        primary_btn(
+            "Previous",
+            callback_data=f"matches_page_{page - 1}",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("⬅️")
+            or _ROLLERS_CASINO_EMOJI_MAP.get("⬇️"),
+        ),
+        primary_btn(
+            "Next",
+            callback_data=f"matches_page_{page + 1}",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("➡️")
+            or _ROLLERS_CASINO_EMOJI_MAP.get("⬆️"),
+        ),
     ]
     keyboard = InlineKeyboardMarkup([
         nav_row,
-        [InlineKeyboardButton("⬅️ Back", callback_data="matches_back")],
+        [danger_btn(
+            "Back",
+            callback_data="matches_back",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("❌"),
+        )],
     ])
     return text, keyboard
 
@@ -16856,8 +17257,7 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    last_page = max(1, (len(matches) + MATCHES_PER_PAGE - 1) // MATCHES_PER_PAGE)
-    page = _build_matches_page(user_id, last_page)
+    page = _build_matches_page(user_id, 1)
     if page is None:
         await update.message.reply_text(
             "<b>No matches found!</b>\nStart playing to see your history.",
@@ -16877,6 +17277,21 @@ async def matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # so that show_alert popups are never silently dropped by Telegram.
     user_id = str(query.from_user.id)
     data = query.data or ""
+
+    if data == "match_history":
+        result = _build_matches_page(user_id, 1)
+        if result is None:
+            await query.answer("No matches yet.", show_alert=True)
+            return
+        await query.answer()
+        text, keyboard = result
+        try:
+            await query.edit_message_text(
+                text, reply_markup=keyboard, parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
 
     if data == "matches_back":
         try:
@@ -22826,6 +23241,121 @@ async def handle_claim_rakeback(query, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML
     )
 
+def _referral_back_keyboard(user_id: str, referral_link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        danger_btn(
+            "Back",
+            callback_data="ref_home",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("❌"),
+        )
+    ]])
+
+async def _show_referral_screen(query, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    uid = str(query.from_user.id)
+    currency = get_user_currency(uid)
+    link = await _referral_link(context, uid)
+    stats = _referral_counts(uid)
+    money = lambda value: format_balance_in_currency(value, currency)
+
+    if action == "home":
+        text = _referral_home_text(uid, currency, link)
+        markup = _referral_keyboard(uid, link)
+    elif action == "earnings":
+        text = (
+            f"{_ref_pack_tag('📈')} <b>Referral earnings</b>\n\n"
+            f"{_ref_pack_tag('💵')} Deposit earnings: <b>{money(stats['deposits'])}</b>\n"
+            f"{_ref_pack_tag('🎲')} Wager earnings: <b>{money(stats['wager'])}</b>\n"
+            f"{_ref_pack_tag('🔥')} Total earned: <b>{money(stats['total'])}</b>\n"
+            f"{_ref_pack_tag('✅')} Added to balance: <b>{money(stats['claimed'])}</b>"
+        )
+        markup = _referral_back_keyboard(uid, link)
+    elif action == "invited":
+        lines = [
+            f"{_ref_pack_tag('👥')} <b>Invited users</b>",
+            "",
+            f"Total invited: <b>{len(stats['invited'])}</b>",
+        ]
+        if stats["invited"]:
+            for referred_uid in stats["invited"][:25]:
+                profile = user_profiles.get(referred_uid, {})
+                label = profile.get("username") or profile.get("first_name") or referred_uid
+                earned = float(referral_top_referred.get(uid, {}).get(referred_uid, 0.0) or 0.0)
+                lines.append(f"• {_html.escape(str(label))} — <b>{money(earned)}</b>")
+        else:
+            lines.append("\nNo invited users yet.")
+        text = "\n".join(lines)
+        markup = _referral_back_keyboard(uid, link)
+    elif action == "balance":
+        add_line = (
+            f"\n{_ref_pack_tag('📥')} You can add the referral balance to your real balance."
+            if stats["pending"] >= 1.50
+            else "\nAdd to balance becomes available at $1.50."
+        )
+        text = (
+            f"{_ref_pack_tag('💰')} <b>Referral balance</b>\n\n"
+            f"Available: <b>{money(stats['pending'])}</b>\n"
+            f"Already added: <b>{money(stats['claimed'])}</b>\n"
+            f"{add_line}"
+        )
+        rows = []
+        if stats["pending"] >= 1.50:
+            rows.append([success_btn(
+                "Add to balance",
+                callback_data="ref_add_balance",
+                icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📥"),
+            )])
+        rows.append([danger_btn(
+            "Withdraw",
+            callback_data="ref_withdraw",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("📤"),
+        )])
+        rows.append([danger_btn(
+            "Back",
+            callback_data="ref_home",
+            icon_custom_emoji_id=_ROLLERS_CASINO_EMOJI_MAP.get("❌"),
+        )])
+        markup = InlineKeyboardMarkup(rows)
+    elif action == "statistics":
+        days = referral_daily_earnings.get(uid, {})
+        recent_total = sum(float(value or 0.0) for value in days.values())
+        text = (
+            f"{_ref_pack_tag('📊')} <b>Referral statistics</b>\n\n"
+            f"{_ref_pack_tag('👥')} Invited users: <b>{len(stats['invited'])}</b>\n"
+            f"{_ref_pack_tag('💵')} Deposit commission: <b>{money(stats['deposits'])}</b>\n"
+            f"{_ref_pack_tag('🎲')} Wager commission: <b>{money(stats['wager'])}</b>\n"
+            f"{_ref_pack_tag('📈')} Recorded daily earnings: <b>{money(recent_total)}</b>\n"
+            f"Average per invited user: <b>{money(stats['total'] / len(stats['invited']) if stats['invited'] else 0.0)}</b>"
+        )
+        markup = _referral_back_keyboard(uid, link)
+    elif action == "group":
+        owned = [
+            p for p in group_partnerships.values()
+            if isinstance(p, dict) and str(p.get("owner_id")) == uid
+        ]
+        lines = [f"{_ref_pack_tag('🏦')} <b>Group partnership revenue share</b>", ""]
+        if not owned:
+            lines.append("No group partnership is linked to your account yet.")
+        else:
+            for p in owned[:20]:
+                sign = "+" if float(p.get("balance", 0.0) or 0.0) >= 0 else ""
+                lines.append(
+                    f"• <b>{_html.escape(str(p.get('title') or 'Group'))}</b>\n"
+                    f"  Revshare: <b>{float(p.get('percentage', 0.30)):.0%}</b>\n"
+                    f"  Partner balance: <b>{sign}{money(float(p.get('balance', 0.0) or 0.0))}</b>\n"
+                    f"  Player losses: <b>{money(float(p.get('total_player_loss', 0.0) or 0.0))}</b>\n"
+                    f"  Player profits: <b>{money(float(p.get('total_player_profit', 0.0) or 0.0))}</b>"
+                )
+        text = "\n".join(lines)
+        markup = _referral_back_keyboard(uid, link)
+    else:
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await _edit_callback_text_or_send(query, context, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
 async def handle_claim_referral_commission(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle referral commission claim."""
     global crypto_house_balances
@@ -24015,33 +24545,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await handle_telegram_gifts_refresh(query, context)
         return
     elif query.data == "ref_command":
-        # Show referral info
-        user_id = str(query.from_user.id)
-        user_currency = get_user_currency(user_id)
-        username = query.from_user.first_name or "User"
-        
-        # Get bot username
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username
-        referral_link = f"https://t.me/{bot_username}?start={user_id}"
-        
-        total_claimed_earnings = referral_earnings.get(user_id, 0.0)
-        pending_commission = pending_referral_commissions.get(user_id, 0.0)
-        referred_count = sum(1 for referred_user_id, referrer_id in referral_data.items() if str(referrer_id) == str(user_id))
-        
-        ref_text = (
-            f"🔥 <b>Your Referral Program</b>\n\n"
-            f"💰 <b>Commission Rates:</b>\n"
-            f"  ✅ 8% on deposits\n"
-            f"  ✅ 3% on Level 2 referrals\n"
-            f"  ✅ 1% on Level 3 referrals\n\n"
-            f"📊 <b>Total Referred:</b> {referred_count} users\n"
-            f"💵 <b>Pending Commission:</b> {format_balance_in_currency(pending_commission, user_currency)}\n"
-            f"✅ <b>Total Claimed:</b> {format_balance_in_currency(total_claimed_earnings, user_currency)}\n\n"
-            f"🔗 <b>Your Referral Link:</b>\n"
-            f"`{referral_link}`"
-        )
-        await _edit_callback_text_or_send(query, context, ref_text, parse_mode=ParseMode.HTML)
+        await _show_referral_screen(query, context, "home")
+    elif query.data in {
+        "ref_home", "ref_earnings", "ref_invited", "ref_balance",
+        "ref_statistics", "ref_group",
+    }:
+        await _show_referral_screen(query, context, query.data.replace("ref_", ""))
+    elif query.data == "ref_add_balance":
+        await handle_claim_referral_commission(query, context)
+    elif query.data == "ref_withdraw":
+        await _show_referral_screen(query, context, "balance")
+    elif query.data.startswith("partnership_toggle:"):
+        try:
+            chat_id = int(query.data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await query.answer("Invalid partnership.", show_alert=True)
+            return
+        record = group_partnerships.get(str(chat_id))
+        owner_id = await _group_owner_id(context, chat_id)
+        if not isinstance(record, dict) or owner_id != str(query.from_user.id):
+            await query.answer("Only the group owner can change this partnership.", show_alert=True)
+            return
+        record["owner_id"] = owner_id
+        record["active"] = not bool(record.get("active"))
+        record.setdefault("percentage", 0.30)
+        save_data_critical()
+        await query.answer("Partnership updated.")
+        await _show_partnership_setup(query, context, chat_id)
+    elif query.data.startswith("partnership_rate:"):
+        try:
+            _, chat_id_text, percent_text = query.data.split(":", 2)
+            chat_id = int(chat_id_text)
+            percent = float(percent_text)
+        except (ValueError, IndexError):
+            await query.answer("Invalid revenue-share percentage.", show_alert=True)
+            return
+        record = group_partnerships.get(str(chat_id))
+        owner_id = await _group_owner_id(context, chat_id)
+        if not isinstance(record, dict) or owner_id != str(query.from_user.id):
+            await query.answer("Only the group owner can change this partnership.", show_alert=True)
+            return
+        if not 0 <= percent <= 100:
+            await query.answer("Percentage must be between 0 and 100.", show_alert=True)
+            return
+        record["owner_id"] = owner_id
+        record["percentage"] = percent / 100.0
+        save_data_critical()
+        await query.answer(f"Revenue share set to {percent:.0f}%.")
+        await _show_partnership_setup(query, context, chat_id)
     elif query.data.startswith("refresh:"):
         # Refresh / regenerate deposit address — "auto crypto button"
         try:
@@ -43354,8 +43905,11 @@ def main():
     application.add_handler(CommandHandler("endreffle", endreffle_command))
     application.add_handler(CommandHandler("endraffle", endreffle_command))
     application.add_handler(CommandHandler("maxbet", maxbet_command))
-    application.add_handler(CommandHandler("matches", matches_command))
-    application.add_handler(CallbackQueryHandler(matches_callback, pattern="^matches_(page_-?\\d+|back)$"))
+    application.add_handler(CommandHandler(["matches", "matchhistory", "history"], matches_command))
+    application.add_handler(CallbackQueryHandler(
+        matches_callback,
+        pattern="^(match_history|matches_(page_-?\\d+|back))$",
+    ))
     application.add_handler(CommandHandler("coinflip", coinflip_command))
     application.add_handler(CommandHandler("cf", coinflip_command))
     application.add_handler(CommandHandler("emojis", owner_set_emojis))
@@ -43373,6 +43927,8 @@ def main():
     application.add_handler(CommandHandler("deduct", deduct_balance_command))
     application.add_handler(CommandHandler("pending", pending_deposits_command))
     application.add_handler(CommandHandler("ref", ref_command))
+    application.add_handler(CommandHandler(["partnership", "revshare"], partnership_command))
+    application.add_handler(CommandHandler("setrevshare", setrevshare_command))
     application.add_handler(CommandHandler("streak", streak_command))
     application.add_handler(CommandHandler("refleaderboard", refleaderboard_command))
     application.add_handler(CommandHandler("leaderboard", leaderboard_command))
@@ -43472,7 +44028,9 @@ def main():
     async def _track_user_group_chat(update, context):
         try:
             if update.effective_user and update.effective_chat and update.effective_chat.type in ('group', 'supergroup'):
-                user_last_group_chat[str(update.effective_user.id)] = update.effective_chat.id
+                _uid = str(update.effective_user.id)
+                user_last_group_chat[_uid] = update.effective_chat.id
+                user_last_group_chat_ts[_uid] = time.time()
         except Exception:
             pass
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, _track_user_group_chat), group=-5)
